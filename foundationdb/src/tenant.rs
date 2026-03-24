@@ -11,6 +11,7 @@ use crate::options::TransactionOption;
 use std::future::Future;
 
 use crate::database::TransactError;
+use crate::database::{run_with_hooks, NoopHooks};
 use crate::{
     error, Database, DatabaseTransact, FdbBindingError, FdbError, FdbResult, KeySelector,
     RangeOption, RetryableTransaction, TransactOption, Transaction,
@@ -98,58 +99,11 @@ impl FdbTenant {
         F: Fn(RetryableTransaction, bool) -> Fut,
         Fut: Future<Output = Result<T, FdbBindingError>>,
     {
-        let mut maybe_committed_transaction = false;
-        // we just need to create the transaction once,
-        // in case there is a error, it will be reset automatically
-        let mut transaction = self.create_retryable_trx()?;
-
-        loop {
-            // executing the closure
-            let result_closure = closure(transaction.clone(), maybe_committed_transaction).await;
-
-            if let Err(e) = result_closure {
-                // checks if it is an FdbError
-                if let Some(e) = e.get_fdb_error() {
-                    maybe_committed_transaction = e.is_maybe_committed();
-                    // The closure returned an Error,
-                    match transaction.on_error(e).await {
-                        // we can retry the error
-                        Ok(Ok(t)) => {
-                            transaction = t;
-                            continue;
-                        }
-                        Ok(Err(non_retryable_error)) => {
-                            return Err(FdbBindingError::from(non_retryable_error))
-                        }
-                        // The only FdbBindingError that can be thrown here is `ReferenceToTransactionKept`
-                        Err(non_retryable_error) => return Err(non_retryable_error),
-                    }
-                }
-                // Otherwise, it cannot be retried
-                return Err(e);
-            }
-
-            let commit_result = transaction.commit().await;
-
-            match commit_result {
-                // The only FdbBindingError that can be thrown here is `ReferenceToTransactionKept`
-                Err(err) => return Err(err),
-                Ok(Ok(_)) => return result_closure,
-                Ok(Err(transaction_commit_error)) => {
-                    maybe_committed_transaction = transaction_commit_error.is_maybe_committed();
-                    // we have an error during commit, checking if it is a retryable error
-                    match transaction_commit_error.on_error().await {
-                        Ok(t) => {
-                            transaction = RetryableTransaction::new(t);
-                            continue;
-                        }
-                        Err(non_retryable_error) => {
-                            return Err(FdbBindingError::from(non_retryable_error))
-                        }
-                    }
-                }
-            }
-        }
+        let transaction = self.create_retryable_trx()?;
+        run_with_hooks(transaction, &NoopHooks, |trx, mc| {
+            closure(trx, mc.into())
+        })
+        .await
     }
 
     /// `transact` returns a future which retries on error. It tries to resolve a future created by

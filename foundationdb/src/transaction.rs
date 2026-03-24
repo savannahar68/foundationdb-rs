@@ -33,6 +33,49 @@ use futures::{
 #[cfg_api_versions(min = 610)]
 const METADATA_VERSION_KEY: &[u8] = b"\xff/metadataVersion";
 
+/// Special keyspace prefix for conflicting keys.
+const CONFLICTING_KEYS_PREFIX: &[u8] = b"\xff\xff/transaction/conflicting_keys/";
+// Matches C++ SystemData.cpp conflictingKeysRange end key.
+const CONFLICTING_KEYS_END: &[u8] = b"\xff\xff/transaction/conflicting_keys/\xff\xff";
+
+/// A key range that conflicted during a transaction commit.
+///
+/// Returned by [`Transaction::conflicting_keys`] after a commit conflict
+/// when [`TransactionOption::ReportConflictingKeys`](crate::options::TransactionOption::ReportConflictingKeys)
+/// is enabled.
+///
+/// The special keyspace encodes conflicting ranges using boundary markers:
+/// - Value `b"1"` marks the inclusive start of a conflicting range
+/// - Value `b"0"` marks the exclusive end of a conflicting range
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ConflictingKeyRange {
+    begin: Vec<u8>,
+    end: Vec<u8>,
+}
+
+impl ConflictingKeyRange {
+    /// The inclusive begin of the conflicting key range.
+    pub fn begin(&self) -> &[u8] {
+        &self.begin
+    }
+
+    /// The exclusive end of the conflicting key range.
+    pub fn end(&self) -> &[u8] {
+        &self.end
+    }
+}
+
+impl fmt::Display for ConflictingKeyRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}..{}",
+            String::from_utf8_lossy(&self.begin),
+            String::from_utf8_lossy(&self.end),
+        )
+    }
+}
+
 /// A committed transaction.
 #[derive(Debug)]
 #[repr(transparent)]
@@ -98,6 +141,22 @@ impl TransactionCommitError {
             fdb_sys::fdb_transaction_on_error(self.tr.inner.as_ptr(), self.err.code())
         })
         .map_ok(|()| self.tr)
+    }
+
+    /// Reads the conflicting key ranges that caused this commit failure.
+    ///
+    /// Only returns meaningful results if
+    /// [`TransactionOption::ReportConflictingKeys`](crate::options::TransactionOption::ReportConflictingKeys)
+    /// was set on the transaction **and** the error is `not_committed` (code 1020).
+    ///
+    /// Must be called **before** [`on_error`](Self::on_error) which resets the transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `FdbError` if the special keyspace read fails.
+    #[cfg_attr(feature = "trace", tracing::instrument(level = "debug", skip(self)))]
+    pub async fn conflicting_keys(&self) -> FdbResult<Vec<ConflictingKeyRange>> {
+        self.tr.conflicting_keys().await
     }
 
     /// Reset the transaction to its initial state.
@@ -1228,6 +1287,62 @@ impl Transaction {
     /// transaction has already been reset.
     pub fn reset(&mut self) {
         unsafe { fdb_sys::fdb_transaction_reset(self.inner.as_ptr()) }
+    }
+
+    /// Reads the conflicting key ranges from the special keyspace after a commit conflict.
+    ///
+    /// This method reads from `\xff\xff/transaction/conflicting_keys/` and parses the
+    /// boundary encoding where `b"1"` marks range starts and `b"0"` marks range ends.
+    ///
+    /// The special keyspace read is resolved client-side — no network round-trip to the
+    /// cluster. The future still goes through the FDB network thread event loop, but the
+    /// data comes from an in-memory map populated during the commit response. Returns
+    /// an empty `Vec` if
+    /// [`TransactionOption::ReportConflictingKeys`](crate::options::TransactionOption::ReportConflictingKeys)
+    /// was not set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `FdbError` if the special keyspace read fails.
+    #[cfg_attr(feature = "trace", tracing::instrument(level = "debug", skip(self)))]
+    pub async fn conflicting_keys(&self) -> FdbResult<Vec<ConflictingKeyRange>> {
+        let opt = RangeOption::from((CONFLICTING_KEYS_PREFIX, CONFLICTING_KEYS_END));
+        let range_result = self.get_range(&opt, 1, false).await?;
+
+        let prefix_len = CONFLICTING_KEYS_PREFIX.len();
+        let mut ranges = Vec::new();
+        let mut current_begin: Option<Vec<u8>> = None;
+
+        for kv in range_result.iter() {
+            let raw_key = kv.key();
+            let actual_key = if raw_key.len() > prefix_len {
+                raw_key[prefix_len..].to_vec()
+            } else {
+                Vec::new()
+            };
+
+            match kv.value() {
+                b"1" => {
+                    current_begin = Some(actual_key);
+                }
+                b"0" => {
+                    if let Some(begin) = current_begin.take() {
+                        ranges.push(ConflictingKeyRange {
+                            begin,
+                            end: actual_key,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        debug_assert!(
+            current_begin.is_none(),
+            "unpaired '1' marker in conflicting keys response"
+        );
+
+        Ok(ranges)
     }
 
     /// Adds a conflict range to a transaction without performing the associated read or write.
