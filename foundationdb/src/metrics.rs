@@ -1,3 +1,4 @@
+use crate::transaction::ConflictingKeyRange;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -51,6 +52,8 @@ pub struct TransactionMetrics {
 pub struct TransactionInfo {
     /// Number of retries performed
     pub retries: u64,
+    /// Number of retries caused by commit conflicts (`not_committed`, error 1020)
+    pub conflict_count: u64,
     /// Transaction read version
     pub read_version: Option<i64>,
     /// Transaction commit version
@@ -71,6 +74,9 @@ pub struct MetricsReport {
     pub custom_metrics: HashMap<MetricKey, u64>,
     /// Transaction-level information
     pub transaction: TransactionInfo,
+    /// Conflicting key ranges from the last commit conflict.
+    /// Empty if `TransactionOption::ReportConflictingKeys` was not enabled or the read failed.
+    pub conflicting_keys: Vec<ConflictingKeyRange>,
 }
 
 impl MetricsReport {
@@ -213,6 +219,15 @@ impl TransactionMetrics {
         data.increment_retries();
     }
 
+    /// Increment the conflict counter
+    pub fn increment_conflict_count(&self) {
+        let mut data = self
+            .metrics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        data.transaction.conflict_count += 1;
+    }
+
     /// Reports metrics for a specific FDB command by incrementing the appropriate counters.
     ///
     /// This method updates both the current and total metrics for the given command.
@@ -293,6 +308,15 @@ impl TransactionMetrics {
         let key = MetricKey::new(name, labels);
         // Increment in both current and total custom metrics
         *data.custom_metrics.entry(key.clone()).or_insert(0) += amount;
+    }
+
+    /// Set the conflicting key ranges from a commit conflict.
+    pub fn set_conflicting_keys(&self, keys: Vec<ConflictingKeyRange>) {
+        let mut data = self
+            .metrics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        data.conflicting_keys = keys;
     }
 
     /// Record commit execution time
