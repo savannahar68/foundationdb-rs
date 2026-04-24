@@ -35,6 +35,10 @@ async fn main() {
     let db = Database::new_compat(None)
         .await
         .expect("failed to get database");
+    db.set_option(options::DatabaseOption::TransactionTimeout(5000))
+        .expect("failed to set transaction timeout");
+    db.set_option(options::DatabaseOption::TransactionRetryLimit(3))
+        .expect("failed to set transaction retry limit");
 
     // used to catch the first cluster_version_changed error when using external clients
     // when using external clients, it will throw cluster_version_changed for the first time establish the connection to
@@ -59,19 +63,29 @@ async fn main() {
         .pack(&"multi_version_incr");
 
     // increment or create key with "1"
-    let trx = db.create_trx().expect("could not create transaction");
-    let mut buf = [0u8; 8];
-    byteorder::LE::write_i64(&mut buf, 1);
-    trx.atomic_op(&key, &buf, options::MutationType::Add);
-    trx.commit().await.expect("could not commit");
+    db.run(|trx, _| {
+        let key = key.clone();
+        async move {
+            let mut buf = [0u8; 8];
+            byteorder::LE::write_i64(&mut buf, 1);
+            trx.atomic_op(&key, &buf, options::MutationType::Add);
+            Ok::<(), foundationdb::FdbBindingError>(())
+        }
+    })
+    .await
+    .expect("could not commit");
 
     // read counter value
-    let trx = db.create_trx().expect("could not create transaction");
-    let raw_counter = trx
-        .get(&key, true)
-        .await
-        .expect("could not read key")
-        .expect("no value found");
+    let raw_counter = db.run(|trx, _| {
+        let key = key.clone();
+        async move {
+            let result = trx.get(&key, true).await?;
+            Ok::<_, foundationdb::FdbBindingError>(result)
+        }
+    })
+    .await
+    .expect("could not read key")
+    .expect("no value found");
 
     let counter = byteorder::LE::read_i64(raw_counter.as_ref());
     dbg!(counter);
